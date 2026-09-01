@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 - 2026-09-01
+
+- Fix the macOS menu-bar app crash-looping with SIGSEGV on launch. The broad
+  `kSecMatchLimitAll` Keychain sweep used to find the hash-suffixed
+  `Claude Code-credentials-<hash>` item corrupts the process heap when built
+  with `swiftc -O` on macOS 26; the crash surfaced in the next
+  `SecItemCopyMatching`. The sweep now runs in a short-lived child process
+  (`--list-credential-services`) that prints only service names and exits, so
+  the damaged heap never outlives it.
+- Narrow the macOS menu to the current five-hour session window. Weekly and
+  per-model entries were removed; `--check` still prints every window.
+
 ## 0.2.0 - 2026-09-01
 
 - Add a native macOS AppKit menu-bar implementation with a compact template

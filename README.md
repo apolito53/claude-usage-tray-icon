@@ -3,14 +3,17 @@
 A tiny Linux tray indicator and macOS menu-bar app that keeps Claude
 subscription usage visible without opening Claude Code's `/usage` screen.
 
-The icon shows the percentage remaining in the current five-hour window. Its
-menu shows:
+The icon shows the percentage remaining in the current five-hour window.
+
+The macOS menu is scoped to that five-hour session window only:
 
 - current-session usage and local reset time;
-- seven-day all-model usage and local reset time;
-- any Opus, Sonnet, or overage-specific weekly windows returned by the account;
 - online, stale, or offline status;
 - manual refresh, login-startup, logs, and exit controls.
+
+The Linux menu additionally shows seven-day all-model usage and any Opus,
+Sonnet, or overage-specific weekly windows returned by the account. On both
+platforms `--check` still prints every window the endpoint returns.
 
 On Linux, usage above 50% remaining is green, 21-50% is amber, and 20% or less
 is red. macOS uses a native template image so the number follows the system's
@@ -46,6 +49,16 @@ The app:
 - never sends a prompt or makes a model inference request;
 - polls every five minutes by default;
 - honors `Retry-After` and backs off for at least 10 minutes after HTTP 429.
+
+On macOS every Keychain call is made by a short-lived child process
+(`--emit-credential`) that prints the chosen service name and access token to
+the parent over a pipe and exits. This is a workaround, not a preference: the
+match-all Keychain sweep needed to find the hash-suffixed
+`Claude Code-credentials-<hash>` item corrupts the heap of whichever process
+runs it when built with `swiftc -O` on macOS 26, and the resulting crash lands
+somewhere unrelated later. Confining it to a child that exits immediately keeps
+the menu-bar process clean. Nothing is written to disk, and neither the service
+name nor the token is ever logged.
 
 The endpoint is an internal Claude Code dependency, not a documented public
 Anthropic API. A future Claude Code release can rename or reshape it. The app

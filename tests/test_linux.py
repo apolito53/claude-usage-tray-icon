@@ -340,6 +340,96 @@ class MacOSSourceContractTests(unittest.TestCase):
         self.assertIn('forHTTPHeaderField: "Authorization"', source)
         self.assertNotIn("refreshToken", source)
 
+    def test_all_keychain_access_is_isolated_in_a_child_process(self):
+        """Every Security-framework call must live in the child-mode function.
+
+        The match-all Keychain sweep needed to find the hash-suffixed
+        `Claude Code-credentials-<hash>` item corrupts the heap of whatever
+        process runs it under `swiftc -O` on macOS 26. The damage surfaced far
+        from its cause (SIGSEGV in a later SecItemCopyMatching, then a malloc
+        trap inside CFNetwork), so the whole Keychain path is confined to a
+        child process that exits immediately. The parent must never call
+        Security. See CHANGELOG 0.2.1."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--emit-credential", source)
+        self.assertIn("func runCredentialEmit", source)
+
+        child = source.split("func runCredentialEmit", 1)[1]
+        child = child.split("\nprivate func ", 1)[0]
+
+        # Every Security entry point appears only inside child mode.
+        for symbol in (
+            "SecItemCopyMatching",
+            "kSecMatchLimitAll",
+            "kSecReturnData",
+            "SecCopyErrorMessageString",
+        ):
+            self.assertEqual(
+                source.count(symbol),
+                child.count(symbol),
+                "{} must appear only inside runCredentialEmit".format(symbol),
+            )
+            self.assertGreater(child.count(symbol), 0, symbol)
+
+        # The child exits without unwinding: its heap is already damaged.
+        self.assertIn("Darwin.exit(0)", child)
+
+        # The parent reaches it by re-launching itself.
+        self.assertIn("Process()", source)
+        self.assertIn("process.executableURL = currentExecutableURL", source)
+
+    def test_child_credential_wire_format_carries_no_refresh_token(self):
+        """Only the service name and access token cross the pipe, and the
+        parent must not log either."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('emit("OK', source)
+        self.assertIn('emit("ERR', source)
+        self.assertNotIn("refreshToken", source)
+        # The token is never handed to the logger.
+        self.assertNotIn("logger.info(\"\\(token", source)
+        self.assertNotIn("logger.error(\"\\(token", source)
+
+    def test_rejected_services_are_passed_to_the_child(self):
+        """A 401 marks a service rejected; the next child run must skip it so
+        the pre-0.2.1 fallback-to-next-candidate behavior survives."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("rejectedKeychainServices", source)
+        self.assertIn('"--reject"', source)
+        self.assertIn("rejecting rejected: Set<String>", source)
+
+    def test_legacy_service_name_stays_a_fallback(self):
+        """If the sweep fails or returns nothing, the unhashed item is still
+        tried so the app degrades instead of dying."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("isClaudeCredentialService", source)
+        self.assertIn("modifiedByService[keychainService] == nil", source)
+
+    def test_menu_bar_shows_only_the_five_hour_window(self):
+        """Requested scope: the menu tracks the current five-hour session
+        window only. The weekly and all-windows menu entries were removed, so
+        their outlets must be gone too."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("weeklyItem", source)
+        self.assertNotIn("weeklyResetItem", source)
+        self.assertNotIn("allLimitsItem", source)
+        self.assertIn("sessionResetItem", source)
+        self.assertIn('window("five_hour")', source)
+
     def test_macos_installer_uses_user_launch_agent(self):
         installer = (
             MODULE_PATH.parents[1] / "macos" / "install.sh"
