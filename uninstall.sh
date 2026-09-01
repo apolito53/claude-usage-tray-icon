@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ $(uname -s) == "Darwin" ]]; then
+    exec "$project_root/macos/uninstall.sh" "$@"
+fi
+
 purge_logs=false
 if [[ ${1:-} == "--purge-logs" ]]; then
     purge_logs=true

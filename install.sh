@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ $(uname -s) == "Darwin" ]]; then
+    exec "$project_root/macos/install.sh" "$@"
+fi
+
 usage() {
     echo "Usage: ./install.sh [--no-startup]"
 }
@@ -20,7 +25,6 @@ if [[ $(uname -s) != "Linux" ]]; then
     exit 1
 fi
 
-project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source_path="$project_root/linux/claude_usage_tray.py"
 data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}

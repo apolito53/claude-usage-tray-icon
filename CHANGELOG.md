@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 - 2026-09-01
+
+- Add a native macOS AppKit menu-bar implementation with a compact template
+  icon, usage menus, stale/offline state, and manual refresh.
+- Read Claude subscription OAuth from legacy and hash-suffixed macOS Keychain
+  items without persisting a copy; cache it in memory to reduce prompts.
+- Add a Swift build, mock-response check, per-user LaunchAgent installer, and
+  macOS uninstaller.
+- Make the root install and uninstall scripts dispatch by operating system.
+- Add Ubuntu and macOS GitHub Actions validation.
+
 ## 0.1.0 - 2026-09-01
 
 - Add an Ubuntu AppIndicator showing the percentage remaining in Claude's

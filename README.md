@@ -1,38 +1,44 @@
 # Claude Usage Tray
 
-A tiny Ubuntu AppIndicator that keeps Claude subscription usage visible without
-opening Claude Code's `/usage` screen.
+A tiny Linux tray indicator and macOS menu-bar app that keeps Claude
+subscription usage visible without opening Claude Code's `/usage` screen.
 
-The panel icon shows the percentage remaining in the current five-hour window.
-Its menu shows:
+The icon shows the percentage remaining in the current five-hour window. Its
+menu shows:
 
 - current-session usage and local reset time;
 - seven-day all-model usage and local reset time;
 - any Opus, Sonnet, or overage-specific weekly windows returned by the account;
 - online, stale, or offline status;
-- manual refresh, startup, logs, and exit controls.
+- manual refresh, login-startup, logs, and exit controls.
 
-Usage above 50% remaining is green, 21-50% is amber, and 20% or less is red. If
-a refresh fails after a successful reading, the last value remains visible with
-an offline badge instead of disappearing.
+On Linux, usage above 50% remaining is green, 21-50% is amber, and 20% or less
+is red. macOS uses a native template image so the number follows the system's
+menu-bar tint. If a refresh fails after a successful reading, the last value
+stays visible with an offline badge instead of disappearing.
 
 ## How it works
 
 Claude Code documents subscription percentages in its interactive `/usage`
 screen and in the JSON supplied to custom status-line scripts, but it does not
 currently expose a supported non-interactive `claude usage --json` command.
-This tray calls the same read-only endpoint currently used by Claude Code:
+This app calls the same read-only endpoint currently used by Claude Code:
 
 ```text
 GET https://api.anthropic.com/api/oauth/usage
 ```
 
-The access token is read fresh for each request from the credential file
-managed by Claude Code (`~/.claude/.credentials.json`, or
-`$CLAUDE_CONFIG_DIR/.credentials.json`). `CLAUDE_CODE_OAUTH_TOKEN` is also
-honored when present.
+The OAuth access token comes from the credential managed by Claude Code:
 
-The tray:
+- Linux: `~/.claude/.credentials.json`, or
+  `$CLAUDE_CONFIG_DIR/.credentials.json`.
+- macOS: the `Claude Code-credentials` generic-password item in the login
+  Keychain, including current `Claude Code-credentials-<hash>` variants, with a
+  credential-file fallback for installations that have one.
+- Either platform: `CLAUDE_CODE_OAUTH_TOKEN`, when explicitly present in the
+  process environment.
+
+The app:
 
 - keeps the token in memory only;
 - never logs it or an endpoint response body;
@@ -42,7 +48,7 @@ The tray:
 - honors `Retry-After` and backs off for at least 10 minutes after HTTP 429.
 
 The endpoint is an internal Claude Code dependency, not a documented public
-Anthropic API. A future Claude Code release can rename or reshape it. The tray
+Anthropic API. A future Claude Code release can rename or reshape it. The app
 fails closed when the response no longer matches the expected schema.
 
 Subscription windows are available only for eligible Claude.ai OAuth plans.
@@ -50,15 +56,28 @@ API-key, Bedrock, Vertex, and Foundry authentication do not expose this quota.
 See Anthropic's [authentication documentation](https://code.claude.com/docs/en/team)
 and [status-line field reference](https://code.claude.com/docs/en/statusline).
 
-## Requirements
+## Install
+
+Clone once on either supported platform:
+
+```bash
+git clone git@github.com:apolito53/claude-usage-tray-icon.git
+cd claude-usage-tray-icon
+./install.sh
+```
+
+`install.sh` detects Linux or macOS, installs the native implementation, enables
+startup, and launches it. Use `./install.sh --no-startup` to install without
+login startup.
+
+### Linux requirements
 
 - Ubuntu or a compatible Linux desktop with GTK 3
 - Python 3.8 or newer
 - `python3-gi`
 - AppIndicator3 or AyatanaAppIndicator3
-- Claude Code signed in with an eligible Claude.ai subscription
 
-On Ubuntu 20.04, install the same indicator dependencies used by the Codex tray:
+On Ubuntu 20.04:
 
 ```bash
 sudo apt install python3-gi gir1.2-appindicator3-0.1
@@ -70,22 +89,50 @@ On distributions packaging Ayatana AppIndicator instead:
 sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1
 ```
 
-## Install
+The Linux installer copies the launcher to `~/.local/bin/claude-usage-tray`
+and registers a GNOME autostart entry.
+
+### macOS requirements
+
+- macOS with Apple's Command Line Tools or Xcode
+- Swift compiler discoverable through `xcrun`
+
+Install Command Line Tools if needed:
 
 ```bash
-git clone git@github.com:apolito53/claude-usage-tray-icon.git
-cd claude-usage-tray-icon
-./install.sh
+xcode-select --install
 ```
 
-The installer copies the launcher to `~/.local/bin/claude-usage-tray`, creates
-an application entry, enables GNOME startup, and launches the tray. Use
-`./install.sh --no-startup` to install without autostart.
+The macOS installer compiles the native AppKit source, validates it with a mock
+usage response, installs it under
+`~/Library/Application Support/ClaudeUsageTray`, and registers the per-user
+LaunchAgent `com.apolito.claude-usage-tray`.
 
-Run a one-shot subscription check without starting the tray:
+The first Keychain read can show a macOS approval dialog. Claude Code sometimes
+rewrites its Keychain item during OAuth refresh, which can cause macOS to ask
+again. The menu-bar app minimizes that friction by caching only the access token
+in memory and re-reading Keychain only after launch or HTTP 401. Selecting
+**Always Allow** can help, but Claude Code controls the item's ACL.
+
+## One-shot checks
+
+Linux:
 
 ```bash
 ./linux/claude_usage_tray.py --check
+```
+
+macOS, after installation:
+
+```bash
+"$HOME/Library/Application Support/ClaudeUsageTray/ClaudeUsageTray" --check
+```
+
+The macOS parser and binary can be tested without credentials or a network call:
+
+```bash
+./macos/build.sh /tmp/ClaudeUsageTray
+/tmp/ClaudeUsageTray --mock-response tests/fixtures/usage_response.json
 ```
 
 Override the five-minute refresh interval with a value of at least 60 seconds:
@@ -94,15 +141,17 @@ Override the five-minute refresh interval with a value of at least 60 seconds:
 CLAUDE_USAGE_TRAY_REFRESH_SECONDS=900 claude-usage-tray
 ```
 
+The installed macOS LaunchAgent intentionally uses the default interval and
+does not persist OAuth or configuration environment variables in its plist.
+
 ## Diagnostics and privacy
 
 Private rotating logs live at:
 
-```text
-${XDG_STATE_HOME:-~/.local/state}/claude-usage-tray/usage-tray.log
-```
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/claude-usage-tray/usage-tray.log`
+- macOS: `~/Library/Logs/ClaudeUsageTray/usage-tray.log`
 
-The log directory is mode `0700` and the log is mode `0600`. Logs include only
+Log directories are mode `0700` and logs are mode `0600`. Logs include only
 window identifiers, percentages, and sanitized error summaries. OAuth tokens
 and HTTP response bodies are deliberately excluded.
 
@@ -112,18 +161,22 @@ refresh-token rotation.
 
 ## Testing
 
+Linux and source-contract tests:
+
 ```bash
 python3 -m unittest discover -s tests -v
-bash -n install.sh uninstall.sh
+bash -n install.sh uninstall.sh macos/build.sh macos/install.sh macos/uninstall.sh
 python3 -m py_compile linux/claude_usage_tray.py
 ```
 
+The GitHub Actions workflow repeats those checks on Ubuntu and compiles the
+AppKit executable on a native macOS runner, then runs its mock-response check.
+
 The parser, credential boundary, HTTP behavior, rate-limit backoff, icon, and
-desktop integration are covered using mock responses. This development machine
-currently uses Vertex authentication rather than Claude.ai subscription OAuth,
-so the successful live subscription response remains intentionally unverified.
-The local non-subscription failure path can still be tested without making a
-model request.
+desktop integration use mock responses. The original development machine uses
+Vertex authentication rather than Claude.ai subscription OAuth, so a successful
+live subscription response remains intentionally unverified. The
+non-subscription failure path can still be tested without making a model call.
 
 ## Uninstall
 
@@ -131,4 +184,5 @@ model request.
 ./uninstall.sh
 ```
 
-Pass `--purge-logs` to also remove diagnostic logs.
+The script detects Linux or macOS. Pass `--purge-logs` to also remove private
+diagnostic logs.

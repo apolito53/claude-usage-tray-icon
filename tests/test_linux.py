@@ -18,6 +18,15 @@ SPEC.loader.exec_module(tray)
 
 
 class UsageParserTests(unittest.TestCase):
+    def test_shared_mock_fixture_matches_endpoint_contract(self):
+        fixture = MODULE_PATH.parents[1] / "tests" / "fixtures" / "usage_response.json"
+        snapshot = tray.parse_usage_response(
+            json.loads(fixture.read_text(encoding="utf-8"))
+        )
+
+        self.assertEqual(73, snapshot.primary.remaining_percent)
+        self.assertEqual(42, snapshot.window("seven_day").used_percent)
+
     def test_parses_session_weekly_and_model_windows(self):
         response = {
             "five_hour": {
@@ -300,6 +309,56 @@ class DesktopIntegrationTests(unittest.TestCase):
 
                 tray.set_startup_enabled(False, executable)
                 self.assertFalse(tray.autostart_path().exists())
+
+
+class VersionTests(unittest.TestCase):
+    def test_release_versions_stay_in_sync(self):
+        expected = (MODULE_PATH.parents[1] / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip()
+        macos_source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(expected, tray.APP_VERSION)
+        self.assertIn('appVersion = "{}"'.format(expected), macos_source)
+
+
+class MacOSSourceContractTests(unittest.TestCase):
+    def test_native_source_keeps_sensitive_boundary_explicit(self):
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('keychainService = "Claude Code-credentials"', source)
+        self.assertIn("kSecClassGenericPassword", source)
+        self.assertIn("kSecMatchLimitAll", source)
+        self.assertIn("isClaudeCredentialService", source)
+        self.assertIn("rejectedKeychainServices", source)
+        self.assertIn(tray.USAGE_ENDPOINT, source)
+        self.assertIn('request.httpMethod = "GET"', source)
+        self.assertIn('forHTTPHeaderField: "Authorization"', source)
+        self.assertNotIn("refreshToken", source)
+
+    def test_macos_installer_uses_user_launch_agent(self):
+        installer = (
+            MODULE_PATH.parents[1] / "macos" / "install.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("$HOME/Library/LaunchAgents", installer)
+        self.assertIn("launchctl bootstrap", installer)
+        self.assertNotIn("sudo", installer)
+
+    def test_root_scripts_dispatch_darwin_to_native_scripts(self):
+        root = MODULE_PATH.parents[1]
+        installer = (root / "install.sh").read_text(encoding="utf-8")
+        uninstaller = (root / "uninstall.sh").read_text(encoding="utf-8")
+
+        self.assertIn('exec "$project_root/macos/install.sh" "$@"', installer)
+        self.assertIn(
+            'exec "$project_root/macos/uninstall.sh" "$@"',
+            uninstaller,
+        )
 
 
 if __name__ == "__main__":

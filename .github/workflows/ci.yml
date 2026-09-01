@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.8"
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m py_compile linux/claude_usage_tray.py
+      - run: bash -n install.sh uninstall.sh macos/build.sh macos/install.sh macos/uninstall.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash -n install.sh uninstall.sh macos/build.sh macos/install.sh macos/uninstall.sh
+      - run: ./macos/build.sh "$RUNNER_TEMP/ClaudeUsageTray"
+      - run: >-
+          "$RUNNER_TEMP/ClaudeUsageTray"
+          --mock-response tests/fixtures/usage_response.json
