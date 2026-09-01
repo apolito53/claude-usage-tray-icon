@@ -31,7 +31,7 @@ import urllib.request
 
 APP_ID = "claude-usage-tray"
 APP_NAME = "Claude Usage Tray"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 ICON_LAYOUT_VERSION = 1
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"

@@ -6,15 +6,32 @@ import Security
 
 private let appID = "claude-usage-tray"
 private let appName = "Claude Usage Tray"
-private let appVersion = "0.2.0"
+private let appVersion = "0.2.1"
 private let usageEndpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 private let oauthBeta = "oauth-2025-04-20"
 private let keychainService = "Claude Code-credentials"
 private let responseTimeout: TimeInterval = 12
+// Upper bound on the child Keychain read (see runCredentialEmit). This is
+// generous on purpose: the first read after an install shows a macOS approval
+// dialog, and the clock runs while the user decides. Measured locally, the
+// first run took ~8.5s and the second ~6.9s before settling at ~0.09s, so a
+// tight timeout kills exactly the run the user is watching. The credential
+// load happens off the main thread, so waiting here never freezes the menu.
+private let credentialScanTimeout: TimeInterval = 90
 private let maximumResponseBytes = 256 * 1024
 private let defaultRefreshInterval: TimeInterval = 5 * 60
 private let offlineRetryIntervals: [TimeInterval] = [60, 2 * 60, 5 * 60]
 private let rateLimitRetryIntervals: [TimeInterval] = [10 * 60, 30 * 60, 60 * 60]
+
+// Our own path, used to re-launch this binary in credential-scan child mode.
+private let currentExecutableURL: URL = {
+    if let bundled = Bundle.main.executableURL {
+        return bundled.standardizedFileURL.resolvingSymlinksInPath()
+    }
+    return URL(fileURLWithPath: CommandLine.arguments[0])
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+}()
 
 private let windowLabels: [(String, String)] = [
     ("five_hour", "Current session (5 hours)"),
@@ -153,6 +170,41 @@ private struct KeychainCandidate {
     let modifiedAt: Date
 }
 
+/// Recognizes the legacy `Claude Code-credentials` item and the current
+/// `Claude Code-credentials-<8 hex>` variants Claude Code rewrites on refresh.
+/// File scope because both the parent and the child scan need it.
+private func isClaudeCredentialService(_ serviceName: String) -> Bool {
+    if serviceName == keychainService {
+        return true
+    }
+    let prefix = "\(keychainService)-"
+    guard serviceName.hasPrefix(prefix) else {
+        return false
+    }
+    let suffix = serviceName.dropFirst(prefix.count)
+    let hexadecimal = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+    return suffix.count == 8
+        && suffix.unicodeScalars.allSatisfy { hexadecimal.contains($0) }
+}
+
+/// Extracts `claudeAiOauth.accessToken` from a Claude credential blob.
+/// Pure JSON handling -- no Security calls -- so both the parent (for the
+/// credential-file path) and the child (for the Keychain path) can use it.
+private func accessToken(from data: Data) throws -> String {
+    guard
+        let object = try? JSONSerialization.jsonObject(with: data),
+        let document = object as? [String: Any],
+        let oauth = document["claudeAiOauth"] as? [String: Any],
+        let token = oauth["accessToken"] as? String,
+        !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+        throw UsageError.credential(
+            "Claude Code is not signed in with Claude.ai subscription OAuth. API, Bedrock, Vertex, and Foundry authentication do not expose subscription quota."
+        )
+    }
+    return token.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private final class CredentialStore {
     private let lock = NSLock()
     private var cachedCredential: LoadedCredential?
@@ -220,115 +272,80 @@ private final class CredentialStore {
         )
     }
 
+    /// Ask a short-lived child process for a usable Claude OAuth credential.
+    ///
+    /// Every Security-framework call this app makes now happens in that child;
+    /// see `runCredentialEmit(rejecting:)` for why. Only the chosen service
+    /// name and its access token cross the pipe, and neither is ever logged.
     private func credentialFromKeychain() throws -> LoadedCredential {
-        let candidates = keychainCandidates()
-        var lastFailure: String?
-        var attempted = false
-        for candidate in candidates
-        where !rejectedKeychainServices.contains(candidate.serviceName) {
-            attempted = true
-            do {
-                return LoadedCredential(
-                    token: try tokenFromKeychain(serviceName: candidate.serviceName),
-                    keychainServiceName: candidate.serviceName
-                )
-            } catch {
-                lastFailure = error.localizedDescription
-            }
+        var arguments = ["--emit-credential"]
+        // Services that already answered with a token Claude rejected (HTTP
+        // 401) are skipped, preserving the pre-0.2.1 retry behavior.
+        for rejected in rejectedKeychainServices.sorted() {
+            arguments.append("--reject")
+            arguments.append(rejected)
         }
 
-        if !attempted, !rejectedKeychainServices.isEmpty {
+        let process = Process()
+        process.executableURL = currentExecutableURL
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
             throw UsageError.credential(
-                "Claude rejected every matching macOS Keychain credential. Open Claude Code and run `/login`, then restart Claude Usage Tray."
+                "Could not start the Claude credential reader: \(error.localizedDescription)"
             )
         }
+
+        // A child stuck on a Keychain approval prompt must not hang a refresh.
+        let watchdog = DispatchWorkItem { [weak process] in
+            if process?.isRunning == true {
+                process?.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(
+            deadline: .now() + credentialScanTimeout,
+            execute: watchdog
+        )
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        watchdog.cancel()
+
+        guard process.terminationStatus == 0,
+              let text = String(data: output, encoding: .utf8)
+        else {
+            throw UsageError.credential(
+                "The Claude credential reader did not finish. Open Claude Code and run `/login`, then select Refresh now."
+            )
+        }
+
+        // Wire format: "OK\t<service>\t<token>" or "ERR\t<message>".
+        let fields = text.trimmingCharacters(in: .newlines).split(
+            separator: "\t",
+            maxSplits: 2,
+            omittingEmptySubsequences: false
+        )
+        if fields.first == "OK", fields.count == 3 {
+            let serviceName = String(fields[1])
+            let token = String(fields[2]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard isClaudeCredentialService(serviceName), !token.isEmpty else {
+                throw UsageError.credential(
+                    "The Claude credential reader returned an unexpected result."
+                )
+            }
+            return LoadedCredential(token: token, keychainServiceName: serviceName)
+        }
+        if fields.first == "ERR", fields.count >= 2 {
+            throw UsageError.credential(String(fields[1]))
+        }
         throw UsageError.credential(
-            lastFailure
-                ?? "No Claude.ai OAuth credential was found in macOS Keychain. Sign Claude Code in with an eligible Claude.ai subscription."
+            "The Claude credential reader returned an unexpected result."
         )
     }
 
-    private func keychainCandidates() -> [KeychainCandidate] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        var modifiedByService: [String: Date] = [:]
-        if status == errSecSuccess, let attributes = item as? [[String: Any]] {
-            for attribute in attributes {
-                guard
-                    let serviceName = attribute[kSecAttrService as String] as? String,
-                    isClaudeCredentialService(serviceName)
-                else {
-                    continue
-                }
-                let modifiedAt = attribute[kSecAttrModificationDate as String] as? Date
-                    ?? .distantPast
-                if modifiedAt > (modifiedByService[serviceName] ?? .distantPast) {
-                    modifiedByService[serviceName] = modifiedAt
-                }
-            }
-        }
-
-        // Keep the legacy name as a final fallback even when broad attribute
-        // discovery is unavailable or the item is absent from its result.
-        if modifiedByService[keychainService] == nil {
-            modifiedByService[keychainService] = .distantPast
-        }
-        return modifiedByService
-            .map { KeychainCandidate(serviceName: $0.key, modifiedAt: $0.value) }
-            .sorted {
-                if $0.modifiedAt == $1.modifiedAt {
-                    return $0.serviceName < $1.serviceName
-                }
-                return $0.modifiedAt > $1.modifiedAt
-            }
-    }
-
-    private func isClaudeCredentialService(_ serviceName: String) -> Bool {
-        if serviceName == keychainService {
-            return true
-        }
-        let prefix = "\(keychainService)-"
-        guard serviceName.hasPrefix(prefix) else {
-            return false
-        }
-        let suffix = serviceName.dropFirst(prefix.count)
-        let hexadecimal = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
-        return suffix.count == 8
-            && suffix.unicodeScalars.allSatisfy { hexadecimal.contains($0) }
-    }
-
-    private func tokenFromKeychain(serviceName: String) throws -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            if status == errSecItemNotFound {
-                throw UsageError.credential(
-                    "No Claude.ai OAuth credential was found in macOS Keychain under '\(serviceName)'."
-                )
-            }
-            let detail = SecCopyErrorMessageString(status, nil) as String?
-            throw UsageError.credential(
-                "Could not read Claude's macOS Keychain credential: \(detail ?? "OSStatus \(status)")."
-            )
-        }
-        guard let data = item as? Data else {
-            throw UsageError.credential(
-                "Claude's macOS Keychain credential had an unexpected shape."
-            )
-        }
-        return try accessToken(from: data)
-    }
 
     private func tokenFromCredentialFile(_ url: URL) throws -> String {
         do {
@@ -349,25 +366,12 @@ private final class CredentialStore {
         }
     }
 
-    private func accessToken(from data: Data) throws -> String {
-        guard
-            let object = try? JSONSerialization.jsonObject(with: data),
-            let document = object as? [String: Any],
-            let oauth = document["claudeAiOauth"] as? [String: Any],
-            let token = oauth["accessToken"] as? String,
-            !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            throw UsageError.credential(
-                "Claude Code is not signed in with Claude.ai subscription OAuth. API, Bedrock, Vertex, and Foundry authentication do not expose subscription quota."
-            )
-        }
-        return token.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
 private final class UsageClient {
     private let credentials = CredentialStore()
     private let session: URLSession
+    private let taskLock = NSLock()
     private var task: URLSessionDataTask?
 
     init() {
@@ -377,7 +381,19 @@ private final class UsageClient {
         session = URLSession(configuration: configuration)
     }
 
+    /// Loads the credential and issues the request.
+    ///
+    /// The credential load spawns a child process and can sit behind a macOS
+    /// Keychain approval dialog, so it must not run on the main thread -- doing
+    /// so froze the menu bar for as long as the dialog was up. `completion` may
+    /// therefore be called on a background queue; callers hop to main.
     func getUsage(completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.performRequest(completion: completion)
+        }
+    }
+
+    private func performRequest(completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
         let token: String
         do {
             token = try credentials.token()
@@ -394,7 +410,7 @@ private final class UsageClient {
         request.setValue(oauthBeta, forHTTPHeaderField: "anthropic-beta")
         request.setValue("\(appID)/\(appVersion)", forHTTPHeaderField: "User-Agent")
 
-        task = session.dataTask(with: request) { [weak self] data, response, error in
+        let dataTask = session.dataTask(with: request) { [weak self] data, response, error in
             if let error = error as? URLError, error.code == .cancelled {
                 return
             }
@@ -475,12 +491,18 @@ private final class UsageClient {
                 completion(.failure(error))
             }
         }
-        task?.resume()
+        taskLock.lock()
+        task = dataTask
+        taskLock.unlock()
+        dataTask.resume()
     }
 
     func cancel() {
-        task?.cancel()
+        taskLock.lock()
+        let inFlight = task
         task = nil
+        taskLock.unlock()
+        inFlight?.cancel()
     }
 
     private static func retryAfterSeconds(_ value: String?) -> Int? {
@@ -669,9 +691,65 @@ private enum LaunchAgentManager {
     }
 }
 
-private func statusImage(text: String, offline: Bool) -> NSImage {
-    let size = NSSize(width: 28, height: 18)
-    let image = NSImage(size: size, flipped: false) { rect in
+/// Compact time left until `date`, sized for the menu bar: "2h14m", "47m",
+/// "<1m". Returns nil when there is no reset time to count down to.
+///
+/// Past the reset the window has already rolled over but our cached
+/// percentage has not caught up yet, so this reports "now" rather than a
+/// negative value; the next poll corrects the number.
+private func formatRemaining(until date: Date?, from now: Date = Date()) -> String? {
+    guard let date = date else {
+        return nil
+    }
+    let seconds = date.timeIntervalSince(now)
+    if seconds <= 0 {
+        return "now"
+    }
+    let totalMinutes = Int(seconds / 60)
+    if totalMinutes < 1 {
+        return "<1m"
+    }
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
+    return hours > 0 ? "\(hours)h\(minutes)m" : "\(minutes)m"
+}
+
+/// Longer form for the menu, where there is room: "2 hours 14 minutes".
+private func formatRemainingLong(until date: Date?, from now: Date = Date()) -> String? {
+    guard let date = date else {
+        return nil
+    }
+    let seconds = date.timeIntervalSince(now)
+    if seconds <= 0 {
+        return "now"
+    }
+    let totalMinutes = max(1, Int(seconds / 60))
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
+    var parts: [String] = []
+    if hours > 0 {
+        parts.append("\(hours) hour" + (hours == 1 ? "" : "s"))
+    }
+    if minutes > 0 {
+        parts.append("\(minutes) minute" + (minutes == 1 ? "" : "s"))
+    }
+    return parts.joined(separator: " ")
+}
+
+/// Status-item image: a ring holding the percentage, optionally followed by the
+/// countdown. `detail` is drawn to the right of the ring, so the image -- and
+/// therefore the menu-bar item -- grows only when there is a countdown to show.
+private func statusImage(text: String, detail: String?, offline: Bool) -> NSImage {
+    let ringWidth: CGFloat = 28
+    let detailFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+    var detailWidth: CGFloat = 0
+    if let detail = detail, !detail.isEmpty {
+        detailWidth = ceil(
+            NSString(string: detail).size(withAttributes: [.font: detailFont]).width
+        ) + 3
+    }
+    let size = NSSize(width: ringWidth + detailWidth, height: 18)
+    let image = NSImage(size: size, flipped: false) { _ in
         NSColor.black.setStroke()
         let circle = NSBezierPath(ovalIn: NSRect(x: 5, y: 1, width: 16, height: 16))
         circle.lineWidth = 1.35
@@ -693,8 +771,21 @@ private func statusImage(text: String, offline: Bool) -> NSImage {
             NSColor.black.setFill()
             NSBezierPath(ovalIn: NSRect(x: 20, y: 11.5, width: 5, height: 5)).fill()
         }
+        if let detail = detail, !detail.isEmpty {
+            let detailStyle = NSMutableParagraphStyle()
+            detailStyle.alignment = .left
+            NSString(string: detail).draw(
+                in: NSRect(x: ringWidth, y: 3.4, width: detailWidth, height: 12),
+                withAttributes: [
+                    .font: detailFont,
+                    .foregroundColor: NSColor.black,
+                    .paragraphStyle: detailStyle,
+                ]
+            )
+        }
         return true
     }
+    // Template so the whole item follows the system menu-bar tint.
     image.isTemplate = true
     return image
 }
@@ -707,13 +798,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menu: NSMenu!
     private var summaryItem: NSMenuItem!
     private var sessionResetItem: NSMenuItem!
-    private var weeklyItem: NSMenuItem!
-    private var weeklyResetItem: NSMenuItem!
-    private var allLimitsItem: NSMenuItem!
     private var connectionItem: NSMenuItem!
     private var refreshItem: NSMenuItem!
     private var startAtLoginItem: NSMenuItem!
     private var timer: Timer?
+    // Redraws the countdown between polls; see redrawCountdown().
+    private var displayTimer: Timer?
     private var latestSnapshot: UsageSnapshot?
     private var refreshInProgress = false
     private var consecutiveFailures = 0
@@ -730,35 +820,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         configureMenu()
         logger.info("\(appName) \(appVersion) starting on macOS.")
         refresh()
+        startCountdownTimer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        displayTimer?.invalidate()
         client.cancel()
         logger.info("\(appName) exiting.")
     }
 
     private func configureMenu() {
-        statusItem = NSStatusBar.system.statusItem(withLength: 28)
-        statusItem.button?.image = statusImage(text: "?", offline: false)
+        // Variable length: the item widens only when a countdown is shown.
+        statusItem = NSStatusBar.system.statusItem(
+            withLength: NSStatusItem.variableLength
+        )
+        statusItem.button?.image = statusImage(text: "?", detail: nil, offline: false)
         statusItem.button?.toolTip = "Claude usage loading"
         statusItem.button?.setAccessibilityLabel("Claude usage loading")
 
         menu = NSMenu()
         menu.autoenablesItems = false
+        // Scope: this app reports the rolling five-hour session window only.
+        // The weekly and per-model entries were removed deliberately; the
+        // parser still reads them so `--check` stays useful for diagnostics.
         summaryItem = disabledItem("Claude usage: loading…")
         sessionResetItem = disabledItem("Session reset: loading…")
-        weeklyItem = disabledItem("Weekly usage: loading…")
-        weeklyResetItem = disabledItem("Weekly reset: loading…")
-        allLimitsItem = NSMenuItem(title: "All usage windows", action: nil, keyEquivalent: "")
-        allLimitsItem.isEnabled = false
         connectionItem = disabledItem("Connection: loading…")
         let informationItems: [NSMenuItem] = [
             summaryItem,
             sessionResetItem,
-            weeklyItem,
-            weeklyResetItem,
-            allLimitsItem,
             connectionItem,
         ]
         for item in informationItems {
@@ -860,51 +951,94 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func apply(_ snapshot: UsageSnapshot) {
         let session = snapshot.window("five_hour") ?? snapshot.primary
-        let weekly = snapshot.window("seven_day")
         summaryItem.title = format(session)
-        sessionResetItem.title = formatReset("Session resets", session.resetAt)
-        if let weekly = weekly {
-            weeklyItem.title = format(weekly)
-            weeklyResetItem.title = formatReset("Week resets", weekly.resetAt)
-        } else {
-            weeklyItem.title = "Weekly usage unavailable"
-            weeklyResetItem.title = "Weekly reset unavailable"
-        }
-        let submenu = NSMenu()
-        submenu.autoenablesItems = false
-        for window in snapshot.windows {
-            submenu.addItem(disabledItem(format(window)))
-            submenu.addItem(disabledItem(formatReset("Resets", window.resetAt)))
-        }
-        allLimitsItem.submenu = submenu
-        allLimitsItem.isEnabled = true
+        sessionResetItem.title = sessionResetTitle(for: session)
         connectionItem.title = "Online - updated \(timeFormatter.string(from: snapshot.checkedAt))"
-        updateStatusImage(text: String(session.remainingPercent), offline: false)
+        updateStatusImage(
+            text: String(session.remainingPercent),
+            detail: formatRemaining(until: session.resetAt),
+            offline: false
+        )
+    }
+
+    /// "Session resets in 2 hours 14 minutes - Mon, Sep 1 at 7:29 PM"
+    private func sessionResetTitle(for window: UsageWindow) -> String {
+        guard let resetAt = window.resetAt else {
+            return "Session reset time unavailable"
+        }
+        guard let remaining = formatRemainingLong(until: resetAt) else {
+            return formatReset("Session resets", resetAt)
+        }
+        if remaining == "now" {
+            return "Session resetting now - \(resetFormatter.string(from: resetAt))"
+        }
+        return "Session resets in \(remaining) - \(resetFormatter.string(from: resetAt))"
+    }
+
+    /// Re-renders the countdown from the cached snapshot.
+    ///
+    /// `resets_at` is an absolute timestamp, so the time left can be recomputed
+    /// locally as often as we like. This deliberately makes no network call --
+    /// the poll stays at five minutes while the display stays current, and a
+    /// stale reading keeps counting down behind its offline badge.
+    private func redrawCountdown() {
+        guard let snapshot = latestSnapshot else {
+            return
+        }
+        let session = snapshot.window("five_hour") ?? snapshot.primary
+        let stale = consecutiveFailures > 0
+        sessionResetItem.title = sessionResetTitle(for: session)
+        updateStatusImage(
+            text: String(session.remainingPercent),
+            detail: formatRemaining(until: session.resetAt),
+            offline: stale
+        )
+    }
+
+    private func startCountdownTimer() {
+        displayTimer?.invalidate()
+        // 20s keeps the minute digit honest without meaningful cost.
+        displayTimer = Timer.scheduledTimer(
+            withTimeInterval: 20,
+            repeats: true
+        ) { [weak self] _ in
+            self?.redrawCountdown()
+        }
     }
 
     private func apply(_ error: Error) {
         if let snapshot = latestSnapshot {
-            summaryItem.title = format(snapshot.primary) + " - STALE"
+            let session = snapshot.window("five_hour") ?? snapshot.primary
+            summaryItem.title = format(session) + " - STALE"
+            // The reset time is absolute, so it stays valid while offline.
+            sessionResetItem.title = sessionResetTitle(for: session)
             connectionItem.title = "OFFLINE - showing \(timeFormatter.string(from: snapshot.checkedAt)) reading"
             updateStatusImage(
-                text: String(snapshot.primary.remainingPercent),
+                text: String(session.remainingPercent),
+                detail: formatRemaining(until: session.resetAt),
                 offline: true
             )
             return
         }
         summaryItem.title = "Claude subscription usage unavailable"
         sessionResetItem.title = truncated(error.localizedDescription, limit: 100)
-        weeklyItem.title = "Weekly usage unavailable"
-        weeklyResetItem.title = "Weekly reset unavailable"
-        allLimitsItem.isEnabled = false
         connectionItem.title = "OFFLINE - last attempt \(timeFormatter.string(from: Date()))"
-        updateStatusImage(text: "!", offline: false)
+        updateStatusImage(text: "!", detail: nil, offline: false)
     }
 
-    private func updateStatusImage(text: String, offline: Bool) {
-        statusItem.button?.image = statusImage(text: text, offline: offline)
-        let description = "Claude usage \(text) percent remaining"
-            + (offline ? ", offline" : "")
+    private func updateStatusImage(text: String, detail: String?, offline: Bool) {
+        statusItem.button?.image = statusImage(
+            text: text,
+            detail: detail,
+            offline: offline
+        )
+        var description = "Claude usage \(text) percent remaining"
+        if let detail = detail, detail != "now" {
+            description += ", resets in \(detail)"
+        } else if detail == "now" {
+            description += ", resetting now"
+        }
+        description += (offline ? ", offline" : "")
         statusItem.button?.toolTip = description
         statusItem.button?.setAccessibilityLabel(description)
     }
@@ -999,14 +1133,137 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 }
 
+/// Child-process mode: resolve a usable Claude OAuth credential and print it as
+/// `OK\t<service>\t<token>` (or `ERR\t<message>`), then exit without unwinding.
+///
+/// EVERY Security-framework call this app makes happens here, in a process that
+/// exits moments later. That is deliberate, and it is the fix for the 0.2.1
+/// crash loop.
+///
+/// The match-all + return-attributes sweep below walks every generic-password
+/// item in the login Keychain, which is how the hash-suffixed
+/// `Claude Code-credentials-<hash>` item -- the one Claude Code actually keeps
+/// current -- gets found. Built with `swiftc -O` on macOS 26 that sweep leaves
+/// the process heap corrupted. The scan returns correct data, but the damage
+/// surfaces later and somewhere unrelated: first as SIGSEGV in the next
+/// single-item Keychain read, and once that was isolated, as a malloc freelist
+/// trap inside CFNetwork on the first HTTP request. Reducing it showed the fault is
+/// in the legacy Keychain enumeration itself, not Swift's bridging -- a raw
+/// CFArray/CFDictionary walk crashes identically, and scoping the query with
+/// kSecUseDataProtectionKeychain avoids the crash but hides the hash-suffixed
+/// items that hold the live token.
+///
+/// Rather than keep chasing where the damage lands, all Keychain work is
+/// confined to this child. The parent never calls Security at all, so it cannot
+/// inherit the corruption. Do not move any of this back into the parent --
+/// tests/test_linux.py pins that boundary.
+///
+/// Only the service name and access token cross the pipe to the parent, and
+/// neither is ever written to the log.
+private func runCredentialEmit(rejecting rejected: Set<String>) -> Never {
+    func emit(_ line: String) -> Never {
+        print(line)
+        // Flush by hand, because _exit() below will not do it for us.
+        fflush(stdout)
+        // _exit, not exit: this process's heap may already be corrupted, and
+        // exit() would run atexit handlers plus Swift/CF runtime teardown on
+        // it -- the very thing this child exists to contain. A crash in
+        // teardown happens *after* a valid credential has been written to the
+        // pipe, so the parent would see a nonzero status and silently discard
+        // it. Skipping teardown costs nothing here: the kernel reclaims
+        // everything, and stdout is already flushed.
+        Darwin._exit(0)
+    }
+
+    // 1. Discover candidate service names, newest first.
+    let scan: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecReturnAttributes as String: true,
+        kSecMatchLimit as String: kSecMatchLimitAll,
+    ]
+    var scanResult: CFTypeRef?
+    var modifiedByService: [String: Date] = [:]
+    if SecItemCopyMatching(scan as CFDictionary, &scanResult) == errSecSuccess,
+       let attributes = scanResult as? [[String: Any]] {
+        for attribute in attributes {
+            guard
+                let serviceName = attribute[kSecAttrService as String] as? String,
+                isClaudeCredentialService(serviceName)
+            else {
+                continue
+            }
+            let modifiedAt = attribute[kSecAttrModificationDate as String] as? Date
+                ?? .distantPast
+            if modifiedAt > (modifiedByService[serviceName] ?? .distantPast) {
+                modifiedByService[serviceName] = modifiedAt
+            }
+        }
+    }
+    // Keep the legacy name as a final fallback even when the sweep is
+    // unavailable, fails, or does not list it.
+    if modifiedByService[keychainService] == nil {
+        modifiedByService[keychainService] = .distantPast
+    }
+    let candidates = modifiedByService
+        .map { KeychainCandidate(serviceName: $0.key, modifiedAt: $0.value) }
+        .sorted {
+            if $0.modifiedAt == $1.modifiedAt {
+                return $0.serviceName < $1.serviceName
+            }
+            return $0.modifiedAt > $1.modifiedAt
+        }
+
+    // 2. Read them in order and emit the first that yields an access token.
+    var lastFailure: String?
+    var attempted = false
+    for candidate in candidates where !rejected.contains(candidate.serviceName) {
+        attempted = true
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: candidate.serviceName,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess else {
+            if status == errSecItemNotFound {
+                lastFailure = "No Claude.ai OAuth credential was found in macOS Keychain under '\(candidate.serviceName)'."
+            } else {
+                let detail = SecCopyErrorMessageString(status, nil) as String?
+                lastFailure = "Could not read Claude's macOS Keychain credential: \(detail ?? "OSStatus \(status)")."
+            }
+            continue
+        }
+        guard let data = item as? Data else {
+            lastFailure = "Claude's macOS Keychain credential had an unexpected shape."
+            continue
+        }
+        do {
+            // Service names and tokens contain no tabs, so this stays parseable.
+            emit("OK\t\(candidate.serviceName)\t\(try accessToken(from: data))")
+        } catch {
+            lastFailure = error.localizedDescription
+        }
+    }
+
+    if !attempted, !rejected.isEmpty {
+        emit("ERR\tClaude rejected every matching macOS Keychain credential. Open Claude Code and run `/login`, then restart Claude Usage Tray.")
+    }
+    emit("ERR\t" + (lastFailure
+        ?? "No Claude.ai OAuth credential was found in macOS Keychain. Sign Claude Code in with an eligible Claude.ai subscription."))
+}
+
 private func printSnapshot(_ snapshot: UsageSnapshot) {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss z"
     print("Claude subscription usage:")
     for window in snapshot.windows {
         let reset = window.resetAt.map { formatter.string(from: $0) } ?? "unknown"
+        // Same countdown the menu bar shows, so --check can confirm it.
+        let remaining = formatRemaining(until: window.resetAt).map { " (in \($0))" } ?? ""
         print(
-            "  \(window.label): \(window.remainingPercent)% remaining (\(window.usedPercent)% used); resets \(reset)"
+            "  \(window.label): \(window.remainingPercent)% remaining (\(window.usedPercent)% used); resets \(reset)\(remaining)"
         )
     }
 }
@@ -1036,7 +1293,9 @@ private func runLiveCheck() -> Int32 {
         }
         semaphore.signal()
     }
-    if semaphore.wait(timeout: .now() + responseTimeout + 3) == .timedOut {
+    // Budget the Keychain approval wait as well, not just the HTTP timeout.
+    let deadline = DispatchTime.now() + responseTimeout + credentialScanTimeout + 3
+    if semaphore.wait(timeout: deadline) == .timedOut {
         fputs("Claude usage check failed: request timed out.\n", stderr)
         client.cancel()
         return 1
@@ -1045,6 +1304,16 @@ private func runLiveCheck() -> Int32 {
 }
 
 private let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments.first == "--emit-credential" {
+    // Hidden child mode -- see runCredentialEmit(rejecting:).
+    var rejected: Set<String> = []
+    var index = 1
+    while index + 1 < arguments.count, arguments[index] == "--reject" {
+        rejected.insert(arguments[index + 1])
+        index += 2
+    }
+    runCredentialEmit(rejecting: rejected)
+}
 if arguments.count == 2, arguments[0] == "--mock-response" {
     Darwin.exit(runMockCheck(path: arguments[1]))
 }
@@ -1061,10 +1330,7 @@ guard let instanceLock = SingleInstanceLock() else {
 }
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
-let executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-    .standardizedFileURL
-    .resolvingSymlinksInPath()
-private let delegate = AppDelegate(executableURL: executableURL)
+private let delegate = AppDelegate(executableURL: currentExecutableURL)
 application.delegate = delegate
 application.run()
 withExtendedLifetime(instanceLock) {}
