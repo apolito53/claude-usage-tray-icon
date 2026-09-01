@@ -3,11 +3,15 @@
 A tiny Linux tray indicator and macOS menu-bar app that keeps Claude
 subscription usage visible without opening Claude Code's `/usage` screen.
 
-The icon shows the percentage remaining in the current five-hour window.
+The icon shows the percentage remaining in the current five-hour window. On
+macOS it also shows the time left in that window next to the percentage, for
+example `75% 2h14m`, so the reset is readable without opening the menu. The
+countdown is recomputed locally every 20 seconds and does not add polling; the
+status item keeps its original narrow width when no reset time is known.
 
 The macOS menu is scoped to that five-hour session window only:
 
-- current-session usage and local reset time;
+- current-session usage, time until reset, and local reset time;
 - online, stale, or offline status;
 - manual refresh, login-startup, logs, and exit controls.
 

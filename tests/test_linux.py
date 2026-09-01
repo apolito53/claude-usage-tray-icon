@@ -430,6 +430,51 @@ class MacOSSourceContractTests(unittest.TestCase):
         self.assertIn("sessionResetItem", source)
         self.assertIn('window("five_hour")', source)
 
+    def test_menu_bar_shows_time_remaining_next_to_the_percentage(self):
+        """The status item renders the percentage and the time left in the
+        current five-hour window, so the reset is readable without opening the
+        menu."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("func formatRemaining", source)
+        # The icon renderer takes the countdown as a second, optional field.
+        self.assertIn("func statusImage(text: String, detail: String?", source)
+        # A fixed 28pt item cannot fit both, so the item sizes to its content.
+        self.assertIn("NSStatusItem.variableLength", source)
+        self.assertNotIn("statusItem(withLength: 28)", source)
+
+    def test_countdown_ticks_without_refetching_usage(self):
+        """resets_at is absolute, so the countdown can be re-rendered locally.
+
+        It must not drive network traffic: the poll stays at five minutes while
+        the displayed time updates far more often."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("displayTimer", source)
+        self.assertIn("func redrawCountdown", source)
+
+        # The redraw path must not call the usage client.
+        redraw = source.split("func redrawCountdown", 1)[1]
+        redraw = redraw.split("\n    private func ", 1)[0]
+        self.assertNotIn("client.getUsage", redraw)
+        self.assertNotIn("refresh()", redraw)
+
+    def test_countdown_survives_a_failed_refresh(self):
+        """A stale reading still has a valid absolute reset time, so the
+        countdown keeps running with the offline badge instead of blanking."""
+        source = (
+            MODULE_PATH.parents[1] / "macos" / "ClaudeUsageTray.swift"
+        ).read_text(encoding="utf-8")
+
+        stale = source.split("private func apply(_ error: Error)", 1)[1]
+        stale = stale.split("\n    private func ", 1)[0]
+        self.assertIn("formatRemaining", stale)
+        self.assertIn("offline: true", stale)
+
     def test_macos_installer_uses_user_launch_agent(self):
         installer = (
             MODULE_PATH.parents[1] / "macos" / "install.sh"

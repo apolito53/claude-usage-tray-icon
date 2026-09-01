@@ -2,6 +2,14 @@
 
 ## 0.2.1 - 2026-09-01
 
+- Show the time left in the current five-hour window next to the percentage in
+  the macOS menu bar (for example `75% 2h14m`), with the precise reset time and
+  a long-form countdown in the menu. The status item now sizes itself to its
+  content and stays at its original width when no reset time is known.
+- Recompute that countdown locally every 20 seconds. `resets_at` is absolute,
+  so the displayed time stays current without extra polling, and a stale
+  reading keeps counting down behind its offline badge.
+
 - Fix the macOS menu-bar app crash-looping with SIGSEGV on launch. The broad
   `kSecMatchLimitAll` Keychain sweep used to find the hash-suffixed
   `Claude Code-credentials-<hash>` item corrupts the process heap when built

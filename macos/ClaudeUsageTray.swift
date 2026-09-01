@@ -691,9 +691,65 @@ private enum LaunchAgentManager {
     }
 }
 
-private func statusImage(text: String, offline: Bool) -> NSImage {
-    let size = NSSize(width: 28, height: 18)
-    let image = NSImage(size: size, flipped: false) { rect in
+/// Compact time left until `date`, sized for the menu bar: "2h14m", "47m",
+/// "<1m". Returns nil when there is no reset time to count down to.
+///
+/// Past the reset the window has already rolled over but our cached
+/// percentage has not caught up yet, so this reports "now" rather than a
+/// negative value; the next poll corrects the number.
+private func formatRemaining(until date: Date?, from now: Date = Date()) -> String? {
+    guard let date = date else {
+        return nil
+    }
+    let seconds = date.timeIntervalSince(now)
+    if seconds <= 0 {
+        return "now"
+    }
+    let totalMinutes = Int(seconds / 60)
+    if totalMinutes < 1 {
+        return "<1m"
+    }
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
+    return hours > 0 ? "\(hours)h\(minutes)m" : "\(minutes)m"
+}
+
+/// Longer form for the menu, where there is room: "2 hours 14 minutes".
+private func formatRemainingLong(until date: Date?, from now: Date = Date()) -> String? {
+    guard let date = date else {
+        return nil
+    }
+    let seconds = date.timeIntervalSince(now)
+    if seconds <= 0 {
+        return "now"
+    }
+    let totalMinutes = max(1, Int(seconds / 60))
+    let hours = totalMinutes / 60
+    let minutes = totalMinutes % 60
+    var parts: [String] = []
+    if hours > 0 {
+        parts.append("\(hours) hour" + (hours == 1 ? "" : "s"))
+    }
+    if minutes > 0 {
+        parts.append("\(minutes) minute" + (minutes == 1 ? "" : "s"))
+    }
+    return parts.joined(separator: " ")
+}
+
+/// Status-item image: a ring holding the percentage, optionally followed by the
+/// countdown. `detail` is drawn to the right of the ring, so the image -- and
+/// therefore the menu-bar item -- grows only when there is a countdown to show.
+private func statusImage(text: String, detail: String?, offline: Bool) -> NSImage {
+    let ringWidth: CGFloat = 28
+    let detailFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+    var detailWidth: CGFloat = 0
+    if let detail = detail, !detail.isEmpty {
+        detailWidth = ceil(
+            NSString(string: detail).size(withAttributes: [.font: detailFont]).width
+        ) + 3
+    }
+    let size = NSSize(width: ringWidth + detailWidth, height: 18)
+    let image = NSImage(size: size, flipped: false) { _ in
         NSColor.black.setStroke()
         let circle = NSBezierPath(ovalIn: NSRect(x: 5, y: 1, width: 16, height: 16))
         circle.lineWidth = 1.35
@@ -715,8 +771,21 @@ private func statusImage(text: String, offline: Bool) -> NSImage {
             NSColor.black.setFill()
             NSBezierPath(ovalIn: NSRect(x: 20, y: 11.5, width: 5, height: 5)).fill()
         }
+        if let detail = detail, !detail.isEmpty {
+            let detailStyle = NSMutableParagraphStyle()
+            detailStyle.alignment = .left
+            NSString(string: detail).draw(
+                in: NSRect(x: ringWidth, y: 3.4, width: detailWidth, height: 12),
+                withAttributes: [
+                    .font: detailFont,
+                    .foregroundColor: NSColor.black,
+                    .paragraphStyle: detailStyle,
+                ]
+            )
+        }
         return true
     }
+    // Template so the whole item follows the system menu-bar tint.
     image.isTemplate = true
     return image
 }
@@ -733,6 +802,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshItem: NSMenuItem!
     private var startAtLoginItem: NSMenuItem!
     private var timer: Timer?
+    // Redraws the countdown between polls; see redrawCountdown().
+    private var displayTimer: Timer?
     private var latestSnapshot: UsageSnapshot?
     private var refreshInProgress = false
     private var consecutiveFailures = 0
@@ -749,17 +820,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         configureMenu()
         logger.info("\(appName) \(appVersion) starting on macOS.")
         refresh()
+        startCountdownTimer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        displayTimer?.invalidate()
         client.cancel()
         logger.info("\(appName) exiting.")
     }
 
     private func configureMenu() {
-        statusItem = NSStatusBar.system.statusItem(withLength: 28)
-        statusItem.button?.image = statusImage(text: "?", offline: false)
+        // Variable length: the item widens only when a countdown is shown.
+        statusItem = NSStatusBar.system.statusItem(
+            withLength: NSStatusItem.variableLength
+        )
+        statusItem.button?.image = statusImage(text: "?", detail: nil, offline: false)
         statusItem.button?.toolTip = "Claude usage loading"
         statusItem.button?.setAccessibilityLabel("Claude usage loading")
 
@@ -876,17 +952,70 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func apply(_ snapshot: UsageSnapshot) {
         let session = snapshot.window("five_hour") ?? snapshot.primary
         summaryItem.title = format(session)
-        sessionResetItem.title = formatReset("Session resets", session.resetAt)
+        sessionResetItem.title = sessionResetTitle(for: session)
         connectionItem.title = "Online - updated \(timeFormatter.string(from: snapshot.checkedAt))"
-        updateStatusImage(text: String(session.remainingPercent), offline: false)
+        updateStatusImage(
+            text: String(session.remainingPercent),
+            detail: formatRemaining(until: session.resetAt),
+            offline: false
+        )
+    }
+
+    /// "Session resets in 2 hours 14 minutes - Mon, Sep 1 at 7:29 PM"
+    private func sessionResetTitle(for window: UsageWindow) -> String {
+        guard let resetAt = window.resetAt else {
+            return "Session reset time unavailable"
+        }
+        guard let remaining = formatRemainingLong(until: resetAt) else {
+            return formatReset("Session resets", resetAt)
+        }
+        if remaining == "now" {
+            return "Session resetting now - \(resetFormatter.string(from: resetAt))"
+        }
+        return "Session resets in \(remaining) - \(resetFormatter.string(from: resetAt))"
+    }
+
+    /// Re-renders the countdown from the cached snapshot.
+    ///
+    /// `resets_at` is an absolute timestamp, so the time left can be recomputed
+    /// locally as often as we like. This deliberately makes no network call --
+    /// the poll stays at five minutes while the display stays current, and a
+    /// stale reading keeps counting down behind its offline badge.
+    private func redrawCountdown() {
+        guard let snapshot = latestSnapshot else {
+            return
+        }
+        let session = snapshot.window("five_hour") ?? snapshot.primary
+        let stale = consecutiveFailures > 0
+        sessionResetItem.title = sessionResetTitle(for: session)
+        updateStatusImage(
+            text: String(session.remainingPercent),
+            detail: formatRemaining(until: session.resetAt),
+            offline: stale
+        )
+    }
+
+    private func startCountdownTimer() {
+        displayTimer?.invalidate()
+        // 20s keeps the minute digit honest without meaningful cost.
+        displayTimer = Timer.scheduledTimer(
+            withTimeInterval: 20,
+            repeats: true
+        ) { [weak self] _ in
+            self?.redrawCountdown()
+        }
     }
 
     private func apply(_ error: Error) {
         if let snapshot = latestSnapshot {
-            summaryItem.title = format(snapshot.primary) + " - STALE"
+            let session = snapshot.window("five_hour") ?? snapshot.primary
+            summaryItem.title = format(session) + " - STALE"
+            // The reset time is absolute, so it stays valid while offline.
+            sessionResetItem.title = sessionResetTitle(for: session)
             connectionItem.title = "OFFLINE - showing \(timeFormatter.string(from: snapshot.checkedAt)) reading"
             updateStatusImage(
-                text: String(snapshot.primary.remainingPercent),
+                text: String(session.remainingPercent),
+                detail: formatRemaining(until: session.resetAt),
                 offline: true
             )
             return
@@ -894,13 +1023,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         summaryItem.title = "Claude subscription usage unavailable"
         sessionResetItem.title = truncated(error.localizedDescription, limit: 100)
         connectionItem.title = "OFFLINE - last attempt \(timeFormatter.string(from: Date()))"
-        updateStatusImage(text: "!", offline: false)
+        updateStatusImage(text: "!", detail: nil, offline: false)
     }
 
-    private func updateStatusImage(text: String, offline: Bool) {
-        statusItem.button?.image = statusImage(text: text, offline: offline)
-        let description = "Claude usage \(text) percent remaining"
-            + (offline ? ", offline" : "")
+    private func updateStatusImage(text: String, detail: String?, offline: Bool) {
+        statusItem.button?.image = statusImage(
+            text: text,
+            detail: detail,
+            offline: offline
+        )
+        var description = "Claude usage \(text) percent remaining"
+        if let detail = detail, detail != "now" {
+            description += ", resets in \(detail)"
+        } else if detail == "now" {
+            description += ", resetting now"
+        }
+        description += (offline ? ", offline" : "")
         statusItem.button?.toolTip = description
         statusItem.button?.setAccessibilityLabel(description)
     }
@@ -1115,8 +1253,10 @@ private func printSnapshot(_ snapshot: UsageSnapshot) {
     print("Claude subscription usage:")
     for window in snapshot.windows {
         let reset = window.resetAt.map { formatter.string(from: $0) } ?? "unknown"
+        // Same countdown the menu bar shows, so --check can confirm it.
+        let remaining = formatRemaining(until: window.resetAt).map { " (in \($0))" } ?? ""
         print(
-            "  \(window.label): \(window.remainingPercent)% remaining (\(window.usedPercent)% used); resets \(reset)"
+            "  \(window.label): \(window.remainingPercent)% remaining (\(window.usedPercent)% used); resets \(reset)\(remaining)"
         )
     }
 }
