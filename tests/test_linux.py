@@ -374,8 +374,14 @@ class MacOSSourceContractTests(unittest.TestCase):
             )
             self.assertGreater(child.count(symbol), 0, symbol)
 
-        # The child exits without unwinding: its heap is already damaged.
-        self.assertIn("Darwin.exit(0)", child)
+        # The child must _exit, not exit: its heap is already damaged, so
+        # atexit handlers and runtime teardown are exactly what we are
+        # containing. A crash during teardown would hand the parent a nonzero
+        # status and make it discard a credential it had already emitted.
+        self.assertIn("Darwin._exit(0)", child)
+        self.assertNotIn("Darwin.exit(", child)
+        # Buffered stdout must reach the pipe before skipping teardown.
+        self.assertIn("fflush(stdout)", child)
 
         # The parent reaches it by re-launching itself.
         self.assertIn("Process()", source)

@@ -1163,9 +1163,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 private func runCredentialEmit(rejecting rejected: Set<String>) -> Never {
     func emit(_ line: String) -> Never {
         print(line)
+        // Flush by hand, because _exit() below will not do it for us.
         fflush(stdout)
-        // Deliberately skips normal teardown -- see the note above.
-        Darwin.exit(0)
+        // _exit, not exit: this process's heap may already be corrupted, and
+        // exit() would run atexit handlers plus Swift/CF runtime teardown on
+        // it -- the very thing this child exists to contain. A crash in
+        // teardown happens *after* a valid credential has been written to the
+        // pipe, so the parent would see a nonzero status and silently discard
+        // it. Skipping teardown costs nothing here: the kernel reclaims
+        // everything, and stdout is already flushed.
+        Darwin._exit(0)
     }
 
     // 1. Discover candidate service names, newest first.

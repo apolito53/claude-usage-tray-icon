@@ -9,14 +9,17 @@
 - Recompute that countdown locally every 20 seconds. `resets_at` is absolute,
   so the displayed time stays current without extra polling, and a stale
   reading keeps counting down behind its offline badge.
-
 - Fix the macOS menu-bar app crash-looping with SIGSEGV on launch. The broad
   `kSecMatchLimitAll` Keychain sweep used to find the hash-suffixed
   `Claude Code-credentials-<hash>` item corrupts the process heap when built
-  with `swiftc -O` on macOS 26; the crash surfaced in the next
-  `SecItemCopyMatching`. The sweep now runs in a short-lived child process
-  (`--list-credential-services`) that prints only service names and exits, so
-  the damaged heap never outlives it.
+  with `swiftc -O` on macOS 26. The damage surfaced away from its cause: first
+  as SIGSEGV in the next single-item Keychain read, and once that was moved
+  away, as a malloc freelist trap inside CFNetwork on the first HTTP request.
+  All Security-framework calls therefore now run in a short-lived child process
+  (`--emit-credential`) that resolves the credential, writes the selected
+  service name and access token to the parent over a pipe, and `_exit`s without
+  running teardown on the damaged heap. Nothing is written to disk, and neither
+  the service name nor the token is logged.
 - Narrow the macOS menu to the current five-hour session window. Weekly and
   per-model entries were removed; `--check` still prints every window.
 
