@@ -1064,7 +1064,7 @@ application.setActivationPolicy(.accessory)
 let executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
     .standardizedFileURL
     .resolvingSymlinksInPath()
-let delegate = AppDelegate(executableURL: executableURL)
+private let delegate = AppDelegate(executableURL: executableURL)
 application.delegate = delegate
 application.run()
 withExtendedLifetime(instanceLock) {}
