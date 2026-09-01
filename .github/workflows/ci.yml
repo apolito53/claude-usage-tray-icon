@@ -24,7 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: bash -n install.sh uninstall.sh macos/build.sh macos/install.sh macos/uninstall.sh
-      - run: ./macos/build.sh "$RUNNER_TEMP/ClaudeUsageTray"
+      - name: Build native macOS executable
+        id: swift_build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./macos/build.sh "$RUNNER_TEMP/ClaudeUsageTray" \
+            2>&1 | tee "$RUNNER_TEMP/swift-build.log"
+      - name: Report Swift compiler failure
+        if: steps.swift_build.outcome == 'failure'
+        run: |
+          first_error=$(grep -m 1 'error:' "$RUNNER_TEMP/swift-build.log" || true)
+          echo "::error::${first_error:-Swift compilation failed. See the build log.}"
+          exit 1
       - run: >-
           "$RUNNER_TEMP/ClaudeUsageTray"
           --mock-response tests/fixtures/usage_response.json
